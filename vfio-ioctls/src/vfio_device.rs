@@ -19,7 +19,7 @@ use byteorder::{ByteOrder, NativeEndian};
 #[cfg(feature = "vfio_cdev")]
 use iommufd_bindings::*;
 #[cfg(feature = "vfio_cdev")]
-use iommufd_ioctls::{IommuFd, IommufdHwptData, IommufdVDevice, IommufdVIommu};
+use iommufd_ioctls::{IommuFd, IommufdHwptData, IommufdVDevice, IommufdVIommu, NestedHwptDevice};
 use log::{debug, error, warn};
 use vfio_bindings::bindings::vfio::*;
 use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion, MemoryRegionAddress};
@@ -2310,6 +2310,24 @@ impl VfioDevice {
 impl AsRawFd for VfioDevice {
     fn as_raw_fd(&self) -> RawFd {
         self.device.as_raw_fd()
+    }
+}
+
+#[cfg(feature = "vfio_cdev")]
+impl NestedHwptDevice for VfioDevice {
+    fn install_s1_hwpt(
+        &self,
+        vdevice: &mut IommufdVDevice,
+        data: &IommufdHwptData,
+    ) -> std::io::Result<()> {
+        // Inherent methods win method resolution, so this is not recursive.
+        self.install_s1_hwpt(vdevice, data)
+            .map_err(std::io::Error::other)
+    }
+
+    fn uninstall_s1_hwpt(&self, vdevice: &mut IommufdVDevice, abort: bool) -> std::io::Result<()> {
+        self.uninstall_s1_hwpt(vdevice, abort)
+            .map_err(std::io::Error::other)
     }
 }
 
