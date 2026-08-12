@@ -19,7 +19,7 @@ use byteorder::{ByteOrder, NativeEndian};
 #[cfg(feature = "vfio_cdev")]
 use iommufd_bindings::*;
 #[cfg(feature = "vfio_cdev")]
-use iommufd_ioctls::IommuFd;
+use iommufd_ioctls::{IommuFd, IommufdHwptData, IommufdVDevice, IommufdVIommu};
 use log::{debug, error, warn};
 use vfio_bindings::bindings::vfio::*;
 use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion, MemoryRegionAddress};
@@ -682,6 +682,7 @@ pub struct VfioIommufd {
     // True when we allocated the IOAS and must destroy it on drop
     owns_ioas: bool,
     common: VfioCommon,
+    s1_hwpt_data_type: Option<iommu_hwpt_data_type>,
 }
 
 #[cfg(feature = "vfio_cdev")]
@@ -693,10 +694,13 @@ impl VfioIommufd {
     /// * `iommufd`: the iommufd to be bound with the VFIO device
     /// * `ioas_id`: the IOAS id to be bound with the VFIO device
     /// * `device_fd`: An optional file handle of the hypervisor VFIO device.
+    /// * `s1_hwpt_data_type`: the nested HWPT data type, or `None` to disable
+    ///   nested HWPT.
     pub fn new(
         iommufd: Arc<IommuFd>,
         ioas_id: Option<u32>,
         device_fd: Option<VfioContainerDeviceHandle>,
+        s1_hwpt_data_type: Option<iommu_hwpt_data_type>,
     ) -> Result<Self> {
         let owns_ioas = ioas_id.is_none();
         let ioas_id = match ioas_id {
@@ -722,6 +726,7 @@ impl VfioIommufd {
             ioas_id,
             owns_ioas,
             common: VfioCommon { device_fd },
+            s1_hwpt_data_type,
         };
 
         Ok(vfio_iommufd)
@@ -1209,6 +1214,8 @@ pub struct VfioDevice {
     pub(crate) vfio_ops: Arc<dyn VfioOps>,
     pub(crate) migration_data_fd: Mutex<Option<File>>,
     pub(crate) dma_logging_started: Mutex<bool>,
+    // `None` for legacy container/group devices.
+    pub(crate) iommufd_dev_id: Option<u32>,
 }
 
 /// Remaining migration data reported by the kernel during precopy.
@@ -1306,14 +1313,11 @@ impl VfioDevice {
 
         #[cfg(feature = "vfio_cdev")]
         if let Some(vfio_iommufd) = vfio_ops.as_any().downcast_ref::<VfioIommufd>() {
-            // Open the vfio cdev file
             let device = Self::get_device_cdev_from_path(sysfspath)?;
 
-            // Add the vfio cdev file to VFIO-KVM device tracking
             vfio_iommufd
                 .common
                 .device_set_fd(device.as_raw_fd(), true)?;
-            // Bind the VFIO device to the iommufd file
             Self::bind_cdev_to_iommufd(&device, vfio_iommufd)?;
             // Associate the vfio device to the IOAS within the bound iommufd
             Self::attach_cdev_to_ioas(&device, vfio_iommufd)?;
@@ -1346,6 +1350,7 @@ impl VfioDevice {
             vfio_ops,
             migration_data_fd: Mutex::new(None),
             dma_logging_started: Mutex::new(false),
+            iommufd_dev_id: None,
         })
     }
 
@@ -1391,6 +1396,7 @@ impl VfioDevice {
             vfio_ops,
             migration_data_fd: Mutex::new(None),
             dma_logging_started: Mutex::new(false),
+            iommufd_dev_id: None,
         })
     }
 
@@ -1435,7 +1441,179 @@ impl VfioDevice {
             vfio_ops,
             migration_data_fd: Mutex::new(None),
             dma_logging_started: Mutex::new(false),
+            iommufd_dev_id: None,
         })
+    }
+
+    #[cfg(feature = "vfio_cdev")]
+    /// Create a VFIO device backed by iommufd, with a vIOMMU and vDevice when
+    /// the `VfioIommufd` was configured for nested HWPT. The returned
+    /// `IommufdVDevice` is only present in that case.
+    ///
+    /// # Arguments
+    /// * `sysfspath`: path to the VFIO device in sysfs.
+    /// * `vfio_ops`: the VFIO operations wrapper, which must be a `VfioIommufd`.
+    /// * `viommu`: an existing vIOMMU to reuse, or `None` to allocate one and
+    ///   return it. A reused vIOMMU must be behind the same physical IOMMU as
+    ///   this device, otherwise vDevice creation fails.
+    /// * `virt_sid`: the virtual Stream ID, required when nested HWPT is active.
+    pub fn new_with_iommufd(
+        sysfspath: &Path,
+        vfio_ops: Arc<dyn VfioOps>,
+        viommu: &mut Option<Arc<IommufdVIommu>>,
+        virt_sid: Option<u64>,
+    ) -> Result<(Self, Option<IommufdVDevice>)> {
+        let vfio_iommufd =
+            if let Some(vfio_iommufd) = vfio_ops.as_any().downcast_ref::<VfioIommufd>() {
+                vfio_iommufd
+            } else {
+                return Err(VfioError::DowncastVfioOps);
+            };
+
+        let (device_info, iommufd_vdevice, iommufd_dev_id) = {
+            // Open the vfio cdev file
+            let device = Self::get_device_cdev_from_path(sysfspath)?;
+
+            // Add the vfio cdev file to VFIO-KVM device tracking
+            vfio_iommufd
+                .common
+                .device_set_fd(device.as_raw_fd(), true)?;
+
+            // Bind the VFIO device to the iommufd file
+            let mut bind = vfio_device_bind_iommufd {
+                argsz: mem::size_of::<vfio_device_bind_iommufd>() as u32,
+                flags: 0,
+                iommufd: vfio_iommufd.iommufd.as_raw_fd(),
+                out_devid: 0,
+            };
+            vfio_syscall::bind_device_iommufd(&device, &mut bind)?;
+
+            let iommufd_vdevice = match vfio_iommufd.s1_hwpt_data_type {
+                // Without a stage-1 HWPT the device just joins the IOAS.
+                None => {
+                    let mut attach_data = vfio_device_attach_iommufd_pt {
+                        argsz: mem::size_of::<vfio_device_attach_iommufd_pt>() as u32,
+                        flags: 0,
+                        pt_id: vfio_iommufd.ioas_id,
+                    };
+                    vfio_syscall::attach_device_iommufd_pt(&device, &mut attach_data)?;
+
+                    None
+                }
+                Some(s1_hwpt_data_type) => {
+                    let virt_id = if let Some(virt_sid) = virt_sid {
+                        virt_sid
+                    } else {
+                        return Err(VfioError::MissingVirtSid);
+                    };
+
+                    let viommu = if let Some(viommu) = viommu {
+                        viommu.clone()
+                    } else {
+                        let new_viommu = IommufdVIommu::new(
+                            vfio_iommufd.iommufd.clone(),
+                            vfio_iommufd.ioas_id,
+                            bind.out_devid,
+                            s1_hwpt_data_type,
+                        )
+                        .map_err(VfioError::NewIommufdVIommu)?;
+
+                        let viommu_arc = Arc::new(new_viommu);
+                        *viommu = Some(viommu_arc.clone());
+
+                        viommu_arc
+                    };
+
+                    let vdevice = IommufdVDevice::new(viommu.clone(), bind.out_devid, virt_id)
+                        .map_err(VfioError::NewIommufdVDevice)?;
+
+                    let mut attach_data = vfio_device_attach_iommufd_pt {
+                        argsz: mem::size_of::<vfio_device_attach_iommufd_pt>() as u32,
+                        flags: 0,
+                        pt_id: viommu.bypass_hwpt_id,
+                    };
+                    vfio_syscall::attach_device_iommufd_pt(&device, &mut attach_data)?;
+
+                    Some(vdevice)
+                }
+            };
+
+            let dev_info = VfioDeviceInfo::get_device_info(&device)?;
+            let dev_info = VfioDeviceInfo::new(device, &dev_info);
+
+            (dev_info, iommufd_vdevice, bind.out_devid)
+        };
+
+        let regions = device_info.get_regions()?;
+        let irqs = device_info.get_irqs()?;
+
+        Ok((
+            VfioDevice {
+                device: ManuallyDrop::new(device_info.device),
+                flags: device_info.flags,
+                regions,
+                irqs,
+                sysfspath: Some(sysfspath.to_path_buf()),
+                vfio_ops,
+                migration_data_fd: Mutex::new(None),
+                dma_logging_started: Mutex::new(false),
+                iommufd_dev_id: Some(iommufd_dev_id),
+            },
+            iommufd_vdevice,
+        ))
+    }
+
+    #[cfg(feature = "vfio_cdev")]
+    /// Uninstall the device's stage-1 HWPT, reverting it to the vIOMMU's abort
+    /// HWPT when `abort` is set, or its bypass HWPT otherwise.
+    pub fn uninstall_s1_hwpt(&self, vdevice: &mut IommufdVDevice, abort: bool) -> Result<()> {
+        let hwpt_id = if abort {
+            vdevice.viommu.abort_hwpt_id
+        } else {
+            vdevice.viommu.bypass_hwpt_id
+        };
+        let mut attach_data = vfio_device_attach_iommufd_pt {
+            argsz: mem::size_of::<vfio_device_attach_iommufd_pt>() as u32,
+            flags: 0,
+            pt_id: hwpt_id,
+        };
+        vfio_syscall::attach_device_iommufd_pt(&self.device, &mut attach_data)?;
+
+        vdevice
+            .destroy_s1_hwpt()
+            .map_err(VfioError::IommufdS1HwptDestroy)?;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "vfio_cdev")]
+    /// Install `hwpt_data` as the device's stage-1 HWPT, replacing any existing
+    /// one.
+    pub fn install_s1_hwpt(
+        &self,
+        vdevice: &mut IommufdVDevice,
+        hwpt_data: &IommufdHwptData,
+    ) -> Result<()> {
+        self.uninstall_s1_hwpt(vdevice, true)?;
+
+        let s1_hwpt_id = vdevice
+            .allocate_s1_hwpt(hwpt_data)
+            .map_err(VfioError::IommufdS1HwptAlloc)?;
+
+        let mut attach_data = vfio_device_attach_iommufd_pt {
+            argsz: mem::size_of::<vfio_device_attach_iommufd_pt>() as u32,
+            flags: 0,
+            pt_id: s1_hwpt_id,
+        };
+        vfio_syscall::attach_device_iommufd_pt(&self.device, &mut attach_data)?;
+
+        Ok(())
+    }
+
+    /// The iommufd device id assigned when this device was bound, or `None` for
+    /// legacy container/group devices.
+    pub fn iommufd_dev_id(&self) -> Option<u32> {
+        self.iommufd_dev_id
     }
 
     /// VFIO device reset only if the device supports being reset.
@@ -2253,6 +2431,7 @@ mod tests {
             vfio_ops: Arc::new(create_vfio_container()),
             migration_data_fd: Mutex::new(None),
             dma_logging_started: Mutex::new(false),
+            iommufd_dev_id: None,
         }
     }
 
