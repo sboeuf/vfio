@@ -6,6 +6,22 @@
 
 ## Fixed
 
+# [v0.9.0]
+
+## Changed
+- `VfioIommufd::new` takes the stage-1 HWPT data type and the vIOMMU type to
+  allocate, instead of assuming a single hardcoded combination.
+- Bump `iommufd-bindings` to 0.2.0 and `iommufd-ioctls` to 0.3.0.
+
+## Added
+- Add `VfioDevice::new_with_iommufd` and `VfioDevice::new_with_iommufd_from_fd`,
+  which bind a device to a vIOMMU and return the resulting vDevice, so the
+  caller can drive nested translation on it.
+- Add `VfioDevice::attach_hwpt` to attach a device to a stage-1 HWPT, and
+  implement `iommufd_ioctls::NestedHwptDevice` for `VfioDevice`.
+
+## Fixed
+
 # [v0.8.0]
 
 ## Changed
