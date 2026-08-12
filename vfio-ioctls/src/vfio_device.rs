@@ -683,6 +683,7 @@ pub struct VfioIommufd {
     owns_ioas: bool,
     common: VfioCommon,
     s1_hwpt_data_type: Option<iommu_hwpt_data_type>,
+    viommu_type: iommu_viommu_type,
 }
 
 #[cfg(feature = "vfio_cdev")]
@@ -696,11 +697,15 @@ impl VfioIommufd {
     /// * `device_fd`: An optional file handle of the hypervisor VFIO device.
     /// * `s1_hwpt_data_type`: the nested HWPT data type, or `None` to disable
     ///   nested HWPT.
+    /// * `viommu_type`: the vIOMMU type to allocate for nested devices.
+    ///   `TEGRA241_CMDQV` enables HW_QUEUE, `ARM_SMMUV3` gives basic nested
+    ///   translation. Ignored when `s1_hwpt_data_type` is `None`.
     pub fn new(
         iommufd: Arc<IommuFd>,
         ioas_id: Option<u32>,
         device_fd: Option<VfioContainerDeviceHandle>,
         s1_hwpt_data_type: Option<iommu_hwpt_data_type>,
+        viommu_type: iommu_viommu_type,
     ) -> Result<Self> {
         let owns_ioas = ioas_id.is_none();
         let ioas_id = match ioas_id {
@@ -727,6 +732,7 @@ impl VfioIommufd {
             owns_ioas,
             common: VfioCommon { device_fd },
             s1_hwpt_data_type,
+            viommu_type,
         };
 
         Ok(vfio_iommufd)
@@ -1318,6 +1324,7 @@ impl VfioDevice {
                 vfio_iommufd.ioas_id,
                 out_devid,
                 s1_hwpt_data_type,
+                vfio_iommufd.viommu_type,
             )
             .map_err(VfioError::NewIommufdVIommu)?;
             let viommu_arc = Arc::new(new_viommu);
