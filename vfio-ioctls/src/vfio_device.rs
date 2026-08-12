@@ -1277,8 +1277,9 @@ impl VfioDevice {
     // The binding persists until the cdev file is closed: the kernel tracks
     // the binding on the cdev file and rejects any subsequent attempts
     // (see `df->access_granted` in drivers/vfio/device_cdev.c).
+    // Returns the iommufd device id the kernel assigns to the bound device.
     #[cfg(feature = "vfio_cdev")]
-    fn bind_cdev_to_iommufd(device: &File, vfio_iommufd: &VfioIommufd) -> Result<()> {
+    fn bind_cdev_to_iommufd(device: &File, vfio_iommufd: &VfioIommufd) -> Result<u32> {
         let mut bind = vfio_device_bind_iommufd {
             argsz: mem::size_of::<vfio_device_bind_iommufd>() as u32,
             flags: 0,
@@ -1287,7 +1288,55 @@ impl VfioDevice {
         };
         vfio_syscall::bind_device_iommufd(device, &mut bind)?;
 
-        Ok(())
+        Ok(bind.out_devid)
+    }
+
+    // Attach a freshly bound cdev either to the IOAS, or to a nested vIOMMU and
+    // vDevice when the `VfioIommufd` was created for nested HWPT.
+    #[cfg(feature = "vfio_cdev")]
+    fn setup_iommufd_translation(
+        device: &File,
+        vfio_iommufd: &VfioIommufd,
+        out_devid: u32,
+        viommu: &mut Option<Arc<IommufdVIommu>>,
+        virt_sid: Option<u64>,
+    ) -> Result<Option<IommufdVDevice>> {
+        let Some(s1_hwpt_data_type) = vfio_iommufd.s1_hwpt_data_type else {
+            Self::attach_cdev_to_ioas(device, vfio_iommufd)?;
+            return Ok(None);
+        };
+
+        let virt_id = virt_sid.ok_or(VfioError::MissingVirtSid)?;
+
+        let viommu = if let Some(viommu) = viommu {
+            // Devices behind the same guest vIOMMU share one instance.
+            viommu.clone()
+        } else {
+            // First device behind it: allocate and hand it back for reuse.
+            let new_viommu = IommufdVIommu::new(
+                vfio_iommufd.iommufd.clone(),
+                vfio_iommufd.ioas_id,
+                out_devid,
+                s1_hwpt_data_type,
+            )
+            .map_err(VfioError::NewIommufdVIommu)?;
+            let viommu_arc = Arc::new(new_viommu);
+            *viommu = Some(viommu_arc.clone());
+            viommu_arc
+        };
+
+        let vdevice = IommufdVDevice::new(viommu.clone(), out_devid, virt_id)
+            .map_err(VfioError::NewIommufdVDevice)?;
+
+        // Bypass until the guest enables stage-1 translation.
+        let mut attach_data = vfio_device_attach_iommufd_pt {
+            argsz: mem::size_of::<vfio_device_attach_iommufd_pt>() as u32,
+            flags: 0,
+            pt_id: viommu.bypass_hwpt_id,
+        };
+        vfio_syscall::attach_device_iommufd_pt(device, &mut attach_data)?;
+
+        Ok(Some(vdevice))
     }
 
     // Attach a cdev to the iommufd's IOAS
@@ -1373,12 +1422,10 @@ impl VfioDevice {
             .downcast_ref::<VfioIommufd>()
             .ok_or(VfioError::DowncastVfioOps)?;
 
-        // Add the vfio cdev file to VFIO-KVM device tracking
         vfio_iommufd
             .common
             .device_set_fd(device.as_raw_fd(), true)?;
-        // Bind the VFIO device to the iommufd file
-        Self::bind_cdev_to_iommufd(&device, vfio_iommufd)?;
+        let out_devid = Self::bind_cdev_to_iommufd(&device, vfio_iommufd)?;
         // Associate the vfio device to the IOAS within the bound iommufd
         Self::attach_cdev_to_ioas(&device, vfio_iommufd)?;
 
@@ -1396,8 +1443,54 @@ impl VfioDevice {
             vfio_ops,
             migration_data_fd: Mutex::new(None),
             dma_logging_started: Mutex::new(false),
-            iommufd_dev_id: None,
+            iommufd_dev_id: Some(out_devid),
         })
+    }
+
+    /// The file-descriptor counterpart of [`new_with_iommufd`], for callers that
+    /// open the cdev themselves rather than discovering it from sysfs.
+    ///
+    /// [`new_with_iommufd`]: Self::new_with_iommufd
+    #[cfg(feature = "vfio_cdev")]
+    pub fn new_with_iommufd_from_fd(
+        device: File,
+        vfio_ops: Arc<dyn VfioOps>,
+        viommu: &mut Option<Arc<IommufdVIommu>>,
+        virt_sid: Option<u64>,
+    ) -> Result<(Self, Option<IommufdVDevice>)> {
+        let vfio_iommufd = vfio_ops
+            .as_any()
+            .downcast_ref::<VfioIommufd>()
+            .ok_or(VfioError::DowncastVfioOps)?;
+
+        // Add the vfio cdev file to VFIO-KVM device tracking
+        vfio_iommufd
+            .common
+            .device_set_fd(device.as_raw_fd(), true)?;
+        // Bind the VFIO device to the iommufd file
+        let out_devid = Self::bind_cdev_to_iommufd(&device, vfio_iommufd)?;
+        let iommufd_vdevice =
+            Self::setup_iommufd_translation(&device, vfio_iommufd, out_devid, viommu, virt_sid)?;
+
+        let dev_info = VfioDeviceInfo::get_device_info(&device)?;
+        let device_info = VfioDeviceInfo::new(device, &dev_info);
+        let regions = device_info.get_regions()?;
+        let irqs = device_info.get_irqs()?;
+
+        Ok((
+            VfioDevice {
+                device: ManuallyDrop::new(device_info.device),
+                flags: device_info.flags,
+                regions,
+                irqs,
+                sysfspath: None,
+                vfio_ops,
+                migration_data_fd: Mutex::new(None),
+                dma_logging_started: Mutex::new(false),
+                iommufd_dev_id: Some(out_devid),
+            },
+            iommufd_vdevice,
+        ))
     }
 
     /// Construct a `VfioDevice` from a cdev file that is already
@@ -1480,68 +1573,20 @@ impl VfioDevice {
                 .device_set_fd(device.as_raw_fd(), true)?;
 
             // Bind the VFIO device to the iommufd file
-            let mut bind = vfio_device_bind_iommufd {
-                argsz: mem::size_of::<vfio_device_bind_iommufd>() as u32,
-                flags: 0,
-                iommufd: vfio_iommufd.iommufd.as_raw_fd(),
-                out_devid: 0,
-            };
-            vfio_syscall::bind_device_iommufd(&device, &mut bind)?;
+            let out_devid = Self::bind_cdev_to_iommufd(&device, vfio_iommufd)?;
 
-            let iommufd_vdevice = match vfio_iommufd.s1_hwpt_data_type {
-                // Without a stage-1 HWPT the device just joins the IOAS.
-                None => {
-                    let mut attach_data = vfio_device_attach_iommufd_pt {
-                        argsz: mem::size_of::<vfio_device_attach_iommufd_pt>() as u32,
-                        flags: 0,
-                        pt_id: vfio_iommufd.ioas_id,
-                    };
-                    vfio_syscall::attach_device_iommufd_pt(&device, &mut attach_data)?;
-
-                    None
-                }
-                Some(s1_hwpt_data_type) => {
-                    let virt_id = if let Some(virt_sid) = virt_sid {
-                        virt_sid
-                    } else {
-                        return Err(VfioError::MissingVirtSid);
-                    };
-
-                    let viommu = if let Some(viommu) = viommu {
-                        viommu.clone()
-                    } else {
-                        let new_viommu = IommufdVIommu::new(
-                            vfio_iommufd.iommufd.clone(),
-                            vfio_iommufd.ioas_id,
-                            bind.out_devid,
-                            s1_hwpt_data_type,
-                        )
-                        .map_err(VfioError::NewIommufdVIommu)?;
-
-                        let viommu_arc = Arc::new(new_viommu);
-                        *viommu = Some(viommu_arc.clone());
-
-                        viommu_arc
-                    };
-
-                    let vdevice = IommufdVDevice::new(viommu.clone(), bind.out_devid, virt_id)
-                        .map_err(VfioError::NewIommufdVDevice)?;
-
-                    let mut attach_data = vfio_device_attach_iommufd_pt {
-                        argsz: mem::size_of::<vfio_device_attach_iommufd_pt>() as u32,
-                        flags: 0,
-                        pt_id: viommu.bypass_hwpt_id,
-                    };
-                    vfio_syscall::attach_device_iommufd_pt(&device, &mut attach_data)?;
-
-                    Some(vdevice)
-                }
-            };
+            let iommufd_vdevice = Self::setup_iommufd_translation(
+                &device,
+                vfio_iommufd,
+                out_devid,
+                viommu,
+                virt_sid,
+            )?;
 
             let dev_info = VfioDeviceInfo::get_device_info(&device)?;
             let dev_info = VfioDeviceInfo::new(device, &dev_info);
 
-            (dev_info, iommufd_vdevice, bind.out_devid)
+            (dev_info, iommufd_vdevice, out_devid)
         };
 
         let regions = device_info.get_regions()?;
@@ -1564,6 +1609,23 @@ impl VfioDevice {
     }
 
     #[cfg(feature = "vfio_cdev")]
+    /// Attach this device to an iommufd page-table object by id: an IOAS, an
+    /// HWPT, or a vIOMMU-owned bypass/abort HWPT. Lower-level than
+    /// [`install_s1_hwpt`]; for callers that manage HWPT ids themselves.
+    ///
+    /// [`install_s1_hwpt`]: Self::install_s1_hwpt
+    pub fn attach_hwpt(&self, pt_id: u32) -> Result<()> {
+        let mut attach_data = vfio_device_attach_iommufd_pt {
+            argsz: mem::size_of::<vfio_device_attach_iommufd_pt>() as u32,
+            flags: 0,
+            pt_id,
+        };
+        vfio_syscall::attach_device_iommufd_pt(&self.device, &mut attach_data)?;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "vfio_cdev")]
     /// Uninstall the device's stage-1 HWPT, reverting it to the vIOMMU's abort
     /// HWPT when `abort` is set, or its bypass HWPT otherwise.
     pub fn uninstall_s1_hwpt(&self, vdevice: &mut IommufdVDevice, abort: bool) -> Result<()> {
@@ -1572,12 +1634,7 @@ impl VfioDevice {
         } else {
             vdevice.viommu.bypass_hwpt_id
         };
-        let mut attach_data = vfio_device_attach_iommufd_pt {
-            argsz: mem::size_of::<vfio_device_attach_iommufd_pt>() as u32,
-            flags: 0,
-            pt_id: hwpt_id,
-        };
-        vfio_syscall::attach_device_iommufd_pt(&self.device, &mut attach_data)?;
+        self.attach_hwpt(hwpt_id)?;
 
         vdevice
             .destroy_s1_hwpt()
@@ -1600,12 +1657,7 @@ impl VfioDevice {
             .allocate_s1_hwpt(hwpt_data)
             .map_err(VfioError::IommufdS1HwptAlloc)?;
 
-        let mut attach_data = vfio_device_attach_iommufd_pt {
-            argsz: mem::size_of::<vfio_device_attach_iommufd_pt>() as u32,
-            flags: 0,
-            pt_id: s1_hwpt_id,
-        };
-        vfio_syscall::attach_device_iommufd_pt(&self.device, &mut attach_data)?;
+        self.attach_hwpt(s1_hwpt_id)?;
 
         Ok(())
     }
